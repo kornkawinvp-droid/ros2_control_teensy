@@ -1,5 +1,5 @@
 // ============================================================
-//  micro-ROS Teensy 4.0 — Closed Loop Test (PID + Feed-Forward)
+//  micro-ROS Teensy 4.0 — Super Smooth Closed Loop (PID + FF)
 // ============================================================
 
 #include <Arduino.h>
@@ -52,7 +52,7 @@ float gyro_bias_z = 0.0f;
 const int   TICKS_PER_REV = 2848;
 const float RAD_PER_TICK  = (2.0f * M_PI) / (TICKS_PER_REV * 2.0f);
 const float MAX_WHEEL_VEL = 4.8f;
-const int   MIN_PWM       = 35;
+const int   MIN_PWM       = 35; // ความฝืดเริ่มต้นของมอเตอร์ (Deadband)
 
 const uint32_t CMD_TIMEOUT_MS = 1000;
 const float    LOOP_DT        = 0.02f;
@@ -60,22 +60,36 @@ const float    LOOP_DT        = 0.02f;
 // ============================================================
 // PID PARAMETERS (แยกซ้าย-ขวา)
 // ============================================================
-// ด้านซ้ายหมุนช้ากว่า จึงตั้ง Ki (Integral) ให้ดึงค่าชดเชยขึ้นไวกว่าเล็กน้อย
 const float KP_L = 0.5f, KI_L = 1.2f, KD_L = 0.02f;
 const float KP_R = 0.4f, KI_R = 0.8f, KD_R = 0.01f;
 
+// [UPGRADE 1 & 2] โครงสร้าง PID แบบ Smooth ลดอาการกระตุกและเสียงคราง
 struct PID {
   float kp, ki, kd;
-  float integral, prev_err;
+  float integral, prev_current, filtered_deriv;
+  
   float compute(float target, float current, float dt) {
     float err = target - current;
+    
+    // I-Term: สะสมค่าชดเชย (พร้อม Anti-windup)
     integral += err * dt;
-    integral = constrain(integral, -1.0f, 1.0f); // Anti-windup
-    float deriv = (err - prev_err) / dt;
-    prev_err = err;
-    return (kp * err) + (ki * integral) + (kd * deriv);
+    integral = constrain(integral, -1.0f, 1.0f); 
+
+    // D-Term: Derivative on Measurement (ป้องกัน Derivative Kick เวลารับเป้าหมายใหม่)
+    float deriv = -(current - prev_current) / dt;
+    prev_current = current;
+
+    // เติม Low-pass filter ให้ D-Term ลด Noise จากเอนโค้ดเดอร์
+    filtered_deriv = 0.5f * deriv + 0.5f * filtered_deriv;
+
+    return (kp * err) + (ki * integral) + (kd * filtered_deriv);
   }
-  void reset() { integral = 0.0f; prev_err = 0.0f; }
+  
+  void reset() { 
+    integral = 0.0f; 
+    prev_current = 0.0f; 
+    filtered_deriv = 0.0f; 
+  }
 };
 
 PID wheel_pids[4];
@@ -190,12 +204,23 @@ void isrRR_B() { bool a=digitalRead(ENC_RR_A),b=digitalRead(ENC_RR_B); ticksRR+=
 // ============================================================
 void setMotor(int pinA, int pinB, float duty) {
   duty = constrain(duty, -1.0f, 1.0f);
-  int pwm = (int)(fabsf(duty) * 255);
-  if (pwm > 0 && pwm < MIN_PWM) pwm = MIN_PWM;
+  float abs_duty = fabsf(duty);
+  int pwm = 0;
+
+  // [UPGRADE 3] Smooth Deadband Compensation (ลบขั้นบันไดออก)
+  // แมพเปอร์เซ็นต์คำสั่ง 0-1 ให้เข้ากับช่วงที่มอเตอร์ขยับจริง (MIN_PWM ถึง 255) อย่างนุ่มนวล
+  if (abs_duty > 0.01f) {
+    float min_duty_ratio = (float)MIN_PWM / 255.0f;
+    float mapped_duty = min_duty_ratio + abs_duty * (1.0f - min_duty_ratio);
+    pwm = (int)(mapped_duty * 255.0f);
+    if (pwm > 255) pwm = 255;
+  }
+
   if      (duty >  0.01f) { analogWrite(pinA, pwm); analogWrite(pinB, 0);   }
   else if (duty < -0.01f) { analogWrite(pinA, 0);   analogWrite(pinB, pwm); }
   else                    { analogWrite(pinA, 0);   analogWrite(pinB, 0);   }
 }
+
 void stopAll() {
   setMotor(PWM_FL_A, PWM_FL_B, 0);
   setMotor(PWM_FR_A, PWM_FR_B, 0);
@@ -242,7 +267,6 @@ void timer_callback(rcl_timer_t *, int64_t) {
   float duty[4];
   for (int i = 0; i < 4; i++) {
     if (alive) {
-      // ถ้าเป้าหมายความเร็วเป็น 0 ให้เคลียร์ค่าสะสม (ป้องกันล้อขยับเอง)
       if (fabsf(target_vel[i]) < 0.01f) {
         wheel_pids[i].reset();
         duty[i] = 0.0f;
@@ -398,10 +422,10 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_RR_B), isrRR_B, CHANGE);
 
   // กำหนด PID ให้ล้อแต่ละฝั่ง
-  wheel_pids[0] = {KP_L, KI_L, KD_L, 0, 0}; // 0: FL (ซ้าย)
-  wheel_pids[1] = {KP_R, KI_R, KD_R, 0, 0}; // 1: FR (ขวา)
-  wheel_pids[2] = {KP_L, KI_L, KD_L, 0, 0}; // 2: RL (ซ้าย)
-  wheel_pids[3] = {KP_R, KI_R, KD_R, 0, 0}; // 3: RR (ขวา)
+  wheel_pids[0] = {KP_L, KI_L, KD_L, 0, 0, 0}; // 0: FL (ซ้าย)
+  wheel_pids[1] = {KP_R, KI_R, KD_R, 0, 0, 0}; // 1: FR (ขวา)
+  wheel_pids[2] = {KP_L, KI_L, KD_L, 0, 0, 0}; // 2: RL (ซ้าย)
+  wheel_pids[3] = {KP_R, KI_R, KD_R, 0, 0, 0}; // 3: RR (ขวา)
 
   stopAll();
   delay(500);
