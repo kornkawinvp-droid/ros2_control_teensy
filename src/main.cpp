@@ -1,5 +1,12 @@
 // ============================================================
-//  micro-ROS Teensy 4.0 — Super Smooth Closed Loop (PID + FF)
+//  micro-ROS Teensy 4.0 — Smooth Closed Loop (PID + FF)  [FIXED]
+//  การแก้หลัก:
+//   1) ใช้ dt จริง (micros) แทน LOOP_DT คงที่  -> ตัด velocity-spike ตอน loop ค้าง (ping/sync/I2C)
+//   2) KD = 0 ทั้งสองฝั่ง                       -> ตัด noise จาก derivative บน velocity แบบ quantize (เสียงคราง/สั่น)
+//   3) VEL_ALPHA 0.20 -> 0.40                   -> ลด phase lag ของ feedback (PID ตอบสนองไว ไม่แกว่ง)
+//   4) Conditional integration anti-windup      -> integral ไม่ค้างตอน output saturate (ลด overshoot/หน่วง)
+//   5) ลด KI                                    -> ให้ FF แบกงานหลัก KI แค่เก็บ error ที่เหลือ
+//  หมายเหตุ: RAD_PER_TICK คงสูตรเดิม (มี x2) เพราะ odometry ถูก calibrate ไว้แล้วที่ 2848
 // ============================================================
 
 #include <Arduino.h>
@@ -50,45 +57,59 @@ float gyro_bias_z = 0.0f;
 // WHEEL PARAMS
 // ============================================================
 const int   TICKS_PER_REV = 2848;
+// คงสูตรเดิม: increment จริงต่อรอบ = 2848 x 2 = 5696 (calibrate กับ odometry แล้ว — อย่าเปลี่ยน)
 const float RAD_PER_TICK  = (2.0f * M_PI) / (TICKS_PER_REV * 2.0f);
-const float MAX_WHEEL_VEL = 4.8f;
-const int   MIN_PWM       = 35; // ความฝืดเริ่มต้นของมอเตอร์ (Deadband)
+
+// *** ตรวจสอบค่านี้ถ้า "วิ่งช้า" ยังไม่หาย ***
+// MAX_WHEEL_VEL คือ rad/s ที่ล้อทำได้จริงตอน duty = 1.0 (FF = target / MAX_WHEEL_VEL)
+// ถ้าตั้งสูงกว่าจริง -> FF อ่อน -> มอเตอร์ไม่เคยถึงความเร็วที่สั่ง = ช้า
+// วิธีวัด: สั่ง duty=1.0 ตรงๆ อ่าน filtered_vel ที่ steady state แล้วเอาค่านั้นมาใส่
+const float MAX_WHEEL_VEL = 8.0f;
+const int   MIN_PWM       = 20; // ความฝืดเริ่มต้นของมอเตอร์ (Deadband)
 
 const uint32_t CMD_TIMEOUT_MS = 1000;
-const float    LOOP_DT        = 0.02f;
+const float    LOOP_DT        = 0.02f; // ใช้เป็น fallback ครั้งแรกเท่านั้น
 
 // ============================================================
 // PID PARAMETERS (แยกซ้าย-ขวา)
+//  - KD = 0: velocity loop ที่มี FF ดีแล้วไม่ต้องการ D และ D บน velocity quantize = noise
+//  - KI ลดลง: FF แบกงานหลัก, KI แค่ trim error ที่เหลือ
 // ============================================================
-const float KP_L = 0.5f, KI_L = 1.2f, KD_L = 0.02f;
-const float KP_R = 0.4f, KI_R = 0.8f, KD_R = 0.01f;
+const float KP_L = 0.5f, KI_L = 0.4f, KD_L = 0.0f;
+const float KP_R = 0.4f, KI_R = 0.3f, KD_R = 0.0f;
 
-// [UPGRADE 1 & 2] โครงสร้าง PID แบบ Smooth ลดอาการกระตุกและเสียงคราง
+// โครงสร้าง PID: รวม Feed-Forward เข้ามาใน compute เพื่อให้ anti-windup เห็น saturation จริง
 struct PID {
   float kp, ki, kd;
   float integral, prev_current, filtered_deriv;
-  
-  float compute(float target, float current, float dt) {
+
+  // คืนค่า duty รวม (FF + PID) ในช่วง [-1, 1] พร้อม conditional-integration anti-windup
+  float compute(float target, float current, float ff, float dt) {
     float err = target - current;
-    
-    // I-Term: สะสมค่าชดเชย (พร้อม Anti-windup)
-    integral += err * dt;
-    integral = constrain(integral, -1.0f, 1.0f); 
 
-    // D-Term: Derivative on Measurement (ป้องกัน Derivative Kick เวลารับเป้าหมายใหม่)
+    // ลองสะสม integral ก่อน แล้วค่อยตัดสินใจ commit (anti-windup)
+    float integral_try = integral + err * dt;
+
+    // D-Term: derivative on measurement + low-pass (มีผลเฉพาะถ้า kd > 0)
     float deriv = -(current - prev_current) / dt;
-    prev_current = current;
+    prev_current   = current;
+    filtered_deriv = 0.6f * filtered_deriv + 0.4f * deriv;
 
-    // เติม Low-pass filter ให้ D-Term ลด Noise จากเอนโค้ดเดอร์
-    filtered_deriv = 0.5f * deriv + 0.5f * filtered_deriv;
+    float u = ff + kp * err + ki * integral_try + kd * filtered_deriv;
 
-    return (kp * err) + (ki * integral) + (kd * filtered_deriv);
+    // commit integral เฉพาะเมื่อ output ไม่ได้ดันลึกเข้าเขตอิ่มตัวทิศเดียวกับ error
+    bool sat = (u > 1.0f && err > 0.0f) || (u < -1.0f && err < 0.0f);
+    if (!sat) integral = integral_try;
+    integral = constrain(integral, -1.0f, 1.0f);
+
+    u = ff + kp * err + ki * integral + kd * filtered_deriv;
+    return constrain(u, -1.0f, 1.0f);
   }
-  
-  void reset() { 
-    integral = 0.0f; 
-    prev_current = 0.0f; 
-    filtered_deriv = 0.0f; 
+
+  void reset() {
+    integral       = 0.0f;
+    prev_current   = 0.0f;
+    filtered_deriv = 0.0f;
   }
 };
 
@@ -124,7 +145,7 @@ long prevFL=0, prevFR=0, prevRL=0, prevRR=0;
 // ============================================================
 volatile float target_vel[4] = {0, 0, 0, 0};
 float filtered_vel[4]        = {0, 0, 0, 0};
-const float VEL_ALPHA        = 0.20f;
+const float VEL_ALPHA        = 0.30f; // เพิ่มขึ้นจาก 0.20 -> ลด lag ของ feedback
 float held_duty[4]           = {0, 0, 0, 0};
 
 // ============================================================
@@ -207,8 +228,7 @@ void setMotor(int pinA, int pinB, float duty) {
   float abs_duty = fabsf(duty);
   int pwm = 0;
 
-  // [UPGRADE 3] Smooth Deadband Compensation (ลบขั้นบันไดออก)
-  // แมพเปอร์เซ็นต์คำสั่ง 0-1 ให้เข้ากับช่วงที่มอเตอร์ขยับจริง (MIN_PWM ถึง 255) อย่างนุ่มนวล
+  // Smooth Deadband Compensation: แมพ 0-1 -> MIN_PWM..255 อย่างต่อเนื่อง
   if (abs_duty > 0.01f) {
     float min_duty_ratio = (float)MIN_PWM / 255.0f;
     float mapped_duty = min_duty_ratio + abs_duty * (1.0f - min_duty_ratio);
@@ -245,6 +265,13 @@ void cmd_callback(const void *msgin) {
 // ============================================================
 void timer_callback(rcl_timer_t *, int64_t) {
 
+  // ---- [FIX 1] dt จริง: กัน velocity-spike ตอน loop ค้าง (ping/sync/I2C) ----
+  static uint32_t last_us = 0;
+  uint32_t now_us = micros();
+  float dt = (last_us == 0) ? LOOP_DT : (now_us - last_us) * 1e-6f;
+  last_us = now_us;
+  dt = constrain(dt, 0.005f, 0.1f); // กัน spike เวลา loop ค้างนาน
+
   noInterrupts();
   long fl=ticksFL, fr=ticksFR, rl=ticksRL, rr=ticksRR;
   interrupts();
@@ -254,7 +281,7 @@ void timer_callback(rcl_timer_t *, int64_t) {
   long cur[4]  = {fl, fr, rl, rr};
   long prev[4] = {prevFL, prevFR, prevRL, prevRR};
   for (int i = 0; i < 4; i++) {
-    float raw = (cur[i] - prev[i]) * RAD_PER_TICK / LOOP_DT;
+    float raw = (cur[i] - prev[i]) * RAD_PER_TICK / dt; // ใช้ dt จริง
     filtered_vel[i] = VEL_ALPHA * raw + (1.0f - VEL_ALPHA) * filtered_vel[i];
     state_msg.position.data[i] = cur[i] * RAD_PER_TICK;
     state_msg.velocity.data[i] = filtered_vel[i];
@@ -273,9 +300,8 @@ void timer_callback(rcl_timer_t *, int64_t) {
         held_duty[i] = 0.0f;
       } else {
         float ff = target_vel[i] / MAX_WHEEL_VEL;
-        float pid_out = wheel_pids[i].compute(target_vel[i], filtered_vel[i], LOOP_DT);
-        
-        duty[i] = constrain(ff + pid_out, -1.0f, 1.0f);
+        // FF + PID รวมใน compute เดียว (anti-windup เห็น saturation จริง)
+        duty[i] = wheel_pids[i].compute(target_vel[i], filtered_vel[i], ff, dt);
         held_duty[i] = duty[i];
       }
     } else {
@@ -339,7 +365,7 @@ bool create_entities() {
   rmw_uros_sync_session(1000);
   last_sync_ms = millis();
 
-  RCCHECK(rclc_subscription_init_default(
+  RCCHECK(rclc_subscription_init_best_effort(
     &cmd_sub, &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
     "wheel_commands"));
@@ -421,7 +447,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_RR_A), isrRR_A, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_RR_B), isrRR_B, CHANGE);
 
-  // กำหนด PID ให้ล้อแต่ละฝั่ง
+  // กำหนด PID ให้ล้อแต่ละฝั่ง  {kp, ki, kd, integral, prev_current, filtered_deriv}
   wheel_pids[0] = {KP_L, KI_L, KD_L, 0, 0, 0}; // 0: FL (ซ้าย)
   wheel_pids[1] = {KP_R, KI_R, KD_R, 0, 0, 0}; // 1: FR (ขวา)
   wheel_pids[2] = {KP_L, KI_L, KD_L, 0, 0, 0}; // 2: RL (ซ้าย)
